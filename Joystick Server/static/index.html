@@ -1,0 +1,551 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>ASC Skid Steer Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <!--
+    ASC Skid Steer Control - Web UI
+    Version: 1.2.0
+    Last Updated: 2025-10-04
+    
+    CHANGELOG:
+    v1.2.0 (2025-10-04)
+      - Added: Throttle Hz display showing Axis 3 output as allowable frequency limit
+      - Shows: axis +1 = 0 Hz, axis 0 = half max, axis -1 = max Hz
+    
+    v1.1.0 (2025-10-04)
+      - Added: Independent deadzone sliders for Axis 1 (Y) and Axis 2 (Twist)
+      - Changed: Single deadzone replaced with per-axis deadzones (deadzoneY, deadzoneTwist)
+      - Changed: processAxis() now accepts deadzone parameter
+    
+    v1.0.0 (2025-10-03) - Initial Release
+      - Differential steering control (Y-axis + Twist blending)
+      - Gamepad input with configurable axes
+      - Real-time track status visualization
+      - Teensy configuration panel (HOLD, RAMP, FSTART, FEEDINT, MAXHZ)
+      - Control parameters (Hz cap, sensitivity γ, deadzone)
+      - localStorage persistence for all settings
+      - Emergency stop and config sync buttons
+      - WebSocket connection to ws://192.168.1.43:8765
+  -->
+  <style>
+    :root { --ok:#c6f6d5; --warn:#ffe08a; --bad:#fed7d7; --active:#3182ce; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; max-width: 900px; }
+    h1 { margin: 0 0 8px 0; }
+    .sub { color:#555; margin: 0 0 16px 0; }
+    .row { margin: 12px 0; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:12px; background:#eee; }
+    .ok { background: var(--ok); } .bad { background: var(--bad); } .warn { background: var(--warn); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    button { padding: 10px 16px; margin-right: 8px; border:1px solid #ccc; border-radius:6px; background:#fff; cursor:pointer; }
+    button:hover { background:#f7fafc; }
+    button.active { background: var(--active); color:#fff; border-color: var(--active); }
+    button.danger { background:#fed7d7; border-color:#fc8181; }
+    .stat { display:inline-block; min-width: 88px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; background:#fff; margin-bottom:16px; }
+    label { display:flex; align-items:center; gap:8px; }
+    input[type="number"] { width: 110px; padding:6px 8px; }
+    input[type="range"] { width: 260px; }
+    .mini { color:#666; font-size: 13px; }
+    .mode-indicator { padding: 8px 12px; border-radius: 6px; font-weight: bold; display: inline-block; margin: 8px 0; }
+    .mode-drive { background: #bee3f8; color: #2c5282; }
+    .mode-turn { background: #c6f6d5; color: #22543d; }
+    .mode-rotate { background: #fbd38d; color: #7c2d12; }
+    .track-status { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    .track { padding: 8px; border: 2px solid #e2e8f0; border-radius: 6px; }
+    .track.left { border-left-color: #3182ce; border-left-width: 4px; }
+    .track.right { border-left-color: #38a169; border-left-width: 4px; }
+    .config-section { background: #f7fafc; padding: 12px; border-radius: 8px; margin-top: 12px; }
+    .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>ASC Skid Steer Control - Differential Steering</h1>
+  <p class="sub">
+    <b>Differential Steering:</b> Y-axis (forward/back) + Twist (rotation) blend together.<br>
+    Push forward and twist right for smooth right turns. The harder you twist, the tighter the turn.<br>
+    <b>Speed:</b> Throttle controls overall magnitude. Tracks automatically balance to stay within limits.
+  </p>
+
+  <div class="row card">
+    <div style="width:100%;">
+      <div class="row">
+        RPi WS: <span id="wsUrl" class="mono">ws://192.168.1.43:8765</span>
+        <span id="wsState" class="pill">connecting…</span>
+      </div>
+
+      <div class="row">
+        <button id="btnStop" class="danger">EMERGENCY STOP</button>
+        <button id="btnSyncConfig">Sync Config to Teensys</button>
+        <button id="btnResetDefaults">Reset to Defaults</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Configuration Section -->
+  <div class="card">
+    <strong>Teensy Configuration (Persists in Browser)</strong>
+    <div class="config-section">
+      <div class="config-grid">
+        <label>
+          Hold Time (ms):
+          <input id="cfgHold" type="number" min="0" max="1000" step="10" value="100">
+        </label>
+        <label>
+          Ramp Time (ms):
+          <input id="cfgRamp" type="number" min="50" max="5000" step="50" value="1000">
+        </label>
+        <label>
+          Start Freq (Hz):
+          <input id="cfgFStart" type="number" min="50" max="500" step="10" value="100">
+        </label>
+        <label>
+          Feedback Int (ms):
+          <input id="cfgFeedInt" type="number" min="100" max="10000" step="100" value="2000">
+        </label>
+        <label>
+          Max Hz:
+          <input id="cfgMaxHz" type="number" min="100" max="5750" step="50" value="5750">
+        </label>
+      </div>
+      <div class="mini" style="margin-top:8px;">
+        Changes save automatically. Click "Sync Config to Teensys" to apply.
+      </div>
+    </div>
+  </div>
+
+  <!-- Control Parameters Section -->
+  <div class="card">
+    <strong>Control Parameters (Persists in Browser)</strong>
+    <div class="row">
+      <label>UI Hz Cap:
+        <input id="hzCap" type="number" min="100" max="5750" step="50" value="5750">
+      </label>
+      <label>Sensitivity (γ):
+        <input id="sensGamma" type="range" min="0.3" max="3.0" step="0.1" value="1.0">
+        <span id="sensGammaVal" class="mono">1.0</span>
+      </label>
+    </div>
+    <div class="row">
+      <label>Deadzone Axis 1 (Y):
+        <input id="deadzoneY" type="range" min="0.00" max="0.20" step="0.01" value="0.05">
+        <span id="deadzoneYVal" class="mono">0.05</span>
+      </label>
+      <label>Deadzone Axis 2 (Twist):
+        <input id="deadzoneTwist" type="range" min="0.00" max="0.20" step="0.01" value="0.05">
+        <span id="deadzoneTwistVal" class="mono">0.05</span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div style="width:100%;">
+        <strong>Gamepad:</strong> <span id="gpName" class="mono">none</span><br/>
+        <span class="mono mini">
+          Axis 1 (Y): <span id="axisY">0.00</span> &nbsp;
+          Axis 2 (Twist): <span id="axisTwist">0.00</span> &nbsp;
+          Axis 3 (Throttle): <span id="axisThr">0.00</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span id="modeIndicator" class="mode-indicator mode-drive">STOPPED</span>
+    </div>
+
+    <div class="mono mini">
+      Forward Component: <span id="fwdComp">0.00</span> &nbsp;
+      Rotation Component: <span id="rotComp">0.00</span> &nbsp;
+      Scale Factor: <span id="scaleFactor">1.00</span> &nbsp;
+      Throttle Hz: <span id="throttleHz">0</span>
+    </div>
+
+    <div class="track-status">
+      <div class="track left">
+        <strong>Left Track (Motor 1)</strong><br/>
+        <span class="mono">
+          Dir: <span id="leftDir">STOP</span><br/>
+          Rate: <span id="leftRate">0.00</span><br/>
+          Hz: <span id="leftHz">0</span>
+        </span>
+      </div>
+      <div class="track right">
+        <strong>Right Track (Motor 2)</strong><br/>
+        <span class="mono">
+          Dir: <span id="rightDir">STOP</span><br/>
+          Rate: <span id="rightRate">0.00</span><br/>
+          Hz: <span id="rightHz">0</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="row mono mini" style="margin-top:12px;">
+      Last sent: <span id="sentVal">—</span>
+    </div>
+  </div>
+
+  <script>
+    // ===== DEFAULT CONFIGURATION =====
+    const DEFAULTS = {
+      wsUrl: "ws://192.168.1.43:8765",
+      teensy: {
+        holdMs: 100,
+        rampMs: 1000,
+        fStart: 100,
+        feedbackMs: 2000,
+        maxHz: 5750
+      },
+      control: {
+        hzCap: 5750,
+        sensitivity: 1.0,
+        deadzoneY: 0.05,
+        deadzoneTwist: 0.05,
+        sendRateMs: 50
+      },
+      axes: {
+        y: 1,
+        twist: 2,
+        throttle: 3
+      }
+    };
+
+    const BACKEND_TARGET_HZ = 5750;
+
+    // ===== LOAD CONFIG FROM LOCALSTORAGE OR USE DEFAULTS =====
+    function loadConfig() {
+      const stored = localStorage.getItem('ascSkidSteerConfig');
+      if (stored) {
+        try {
+          const config = JSON.parse(stored);
+          // Migrate old single deadzone to separate deadzones
+          if (config.control && config.control.deadzone !== undefined && config.control.deadzoneY === undefined) {
+            config.control.deadzoneY = config.control.deadzone;
+            config.control.deadzoneTwist = config.control.deadzone;
+            delete config.control.deadzone;
+          }
+          return config;
+        } catch(e) {
+          console.warn("Failed to parse stored config, using defaults");
+          return JSON.parse(JSON.stringify(DEFAULTS));
+        }
+      }
+      return JSON.parse(JSON.stringify(DEFAULTS));
+    }
+
+    function saveConfig() {
+      localStorage.setItem('ascSkidSteerConfig', JSON.stringify(CONFIG));
+      console.log("Config saved to localStorage");
+    }
+
+    function resetToDefaults() {
+      if (confirm("Reset all settings to defaults? This will clear your saved configuration.")) {
+        localStorage.removeItem('ascSkidSteerConfig');
+        location.reload();
+      }
+    }
+
+    let CONFIG = loadConfig();
+
+    // ===== DOM ELEMENTS =====
+    const elState = document.getElementById("wsState");
+    const elGp = document.getElementById("gpName");
+    const elAxisY = document.getElementById("axisY");
+    const elAxisTwist = document.getElementById("axisTwist");
+    const elAxisThr = document.getElementById("axisThr");
+    const elMode = document.getElementById("modeIndicator");
+    const elFwdComp = document.getElementById("fwdComp");
+    const elRotComp = document.getElementById("rotComp");
+    const elScale = document.getElementById("scaleFactor");
+    const elThrottleHz = document.getElementById("throttleHz");
+    const elLeftDir = document.getElementById("leftDir");
+    const elLeftRate = document.getElementById("leftRate");
+    const elLeftHz = document.getElementById("leftHz");
+    const elRightDir = document.getElementById("rightDir");
+    const elRightRate = document.getElementById("rightRate");
+    const elRightHz = document.getElementById("rightHz");
+    const elSent = document.getElementById("sentVal");
+    
+    // Config inputs
+    const elCfgHold = document.getElementById("cfgHold");
+    const elCfgRamp = document.getElementById("cfgRamp");
+    const elCfgFStart = document.getElementById("cfgFStart");
+    const elCfgFeedInt = document.getElementById("cfgFeedInt");
+    const elCfgMaxHz = document.getElementById("cfgMaxHz");
+    const elHzCap = document.getElementById("hzCap");
+    const elGamma = document.getElementById("sensGamma");
+    const elGammaVal = document.getElementById("sensGammaVal");
+    const elDZY = document.getElementById("deadzoneY");
+    const elDZYVal = document.getElementById("deadzoneYVal");
+    const elDZTwist = document.getElementById("deadzoneTwist");
+    const elDZTwistVal = document.getElementById("deadzoneTwistVal");
+    
+    document.getElementById("wsUrl").textContent = CONFIG.wsUrl;
+    const btnStop = document.getElementById("btnStop");
+    const btnSync = document.getElementById("btnSyncConfig");
+    const btnReset = document.getElementById("btnResetDefaults");
+
+    // ===== INITIALIZE UI FROM CONFIG =====
+    elCfgHold.value = CONFIG.teensy.holdMs;
+    elCfgRamp.value = CONFIG.teensy.rampMs;
+    elCfgFStart.value = CONFIG.teensy.fStart;
+    elCfgFeedInt.value = CONFIG.teensy.feedbackMs;
+    elCfgMaxHz.value = CONFIG.teensy.maxHz;
+    elHzCap.value = CONFIG.control.hzCap;
+    elGamma.value = CONFIG.control.sensitivity;
+    elGammaVal.textContent = CONFIG.control.sensitivity.toFixed(1);
+    elDZY.value = CONFIG.control.deadzoneY;
+    elDZYVal.textContent = CONFIG.control.deadzoneY.toFixed(2);
+    elDZTwist.value = CONFIG.control.deadzoneTwist;
+    elDZTwistVal.textContent = CONFIG.control.deadzoneTwist.toFixed(2);
+
+    // ===== CONFIG CHANGE HANDLERS =====
+    elCfgHold.addEventListener('change', () => {
+      CONFIG.teensy.holdMs = parseInt(elCfgHold.value);
+      saveConfig();
+    });
+    elCfgRamp.addEventListener('change', () => {
+      CONFIG.teensy.rampMs = parseInt(elCfgRamp.value);
+      saveConfig();
+    });
+    elCfgFStart.addEventListener('change', () => {
+      CONFIG.teensy.fStart = parseInt(elCfgFStart.value);
+      saveConfig();
+    });
+    elCfgFeedInt.addEventListener('change', () => {
+      CONFIG.teensy.feedbackMs = parseInt(elCfgFeedInt.value);
+      saveConfig();
+    });
+    elCfgMaxHz.addEventListener('change', () => {
+      CONFIG.teensy.maxHz = parseInt(elCfgMaxHz.value);
+      saveConfig();
+    });
+    elHzCap.addEventListener('change', () => {
+      CONFIG.control.hzCap = parseInt(elHzCap.value);
+      saveConfig();
+    });
+    elGamma.addEventListener('input', () => {
+      CONFIG.control.sensitivity = parseFloat(elGamma.value);
+      elGammaVal.textContent = CONFIG.control.sensitivity.toFixed(1);
+      saveConfig();
+    });
+    elDZY.addEventListener('input', () => {
+      CONFIG.control.deadzoneY = parseFloat(elDZY.value);
+      elDZYVal.textContent = CONFIG.control.deadzoneY.toFixed(2);
+      saveConfig();
+    });
+    elDZTwist.addEventListener('input', () => {
+      CONFIG.control.deadzoneTwist = parseFloat(elDZTwist.value);
+      elDZTwistVal.textContent = CONFIG.control.deadzoneTwist.toFixed(2);
+      saveConfig();
+    });
+
+    btnReset.onclick = resetToDefaults;
+
+    // ===== WEBSOCKET & MOTOR CONTROL =====
+    function setState(cls, text){ elState.className = "pill " + cls; elState.textContent = text; }
+    function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+    function thrToRate(a){ return clamp((-a + 1)/2, 0, 1); }
+
+    function processAxis(raw, deadzone){
+      if (Math.abs(raw) < deadzone) return 0;
+      const sign = raw > 0 ? 1 : -1;
+      const scaled = (Math.abs(raw) - deadzone) / (1 - deadzone);
+      return sign * Math.min(1.0, scaled);
+    }
+
+    let ws=null, wsOpen=false;
+    let lastSendT=0;
+    let gamepadReady = false;  // Track if we've seen real gamepad data
+    
+    let motorState = {
+      1: {dir: 0, rate: 0, hz: 0, lastDir: 0, lastRate: 0},
+      2: {dir: 0, rate: 0, hz: 0, lastDir: 0, lastRate: 0}
+    };
+
+    function sendMotorCommand(motor, dir, rate){
+      if (!wsOpen) return;
+      
+      const hz = Math.round(CONFIG.control.hzCap * rate);
+      
+      motorState[motor].dir = dir;
+      motorState[motor].rate = rate;
+      motorState[motor].hz = hz;
+
+      if (dir !== motorState[motor].lastDir){
+        if (dir === 0){
+          ws.send(JSON.stringify({motor: motor, cmd: "stop"}));
+        } else {
+          const dirVal = dir > 0 ? "fwd" : "bwd";
+          ws.send(JSON.stringify({motor: motor, cmd: "dir", value: dirVal}));
+        }
+        motorState[motor].lastDir = dir;
+      }
+
+      if (dir !== 0 && Math.abs(rate - motorState[motor].lastRate) >= 0.01){
+        const effRate = clamp(rate * (CONFIG.control.hzCap / BACKEND_TARGET_HZ), 0, 1);
+        ws.send(JSON.stringify({motor: motor, cmd: "rate", value: effRate}));
+        motorState[motor].lastRate = rate;
+      }
+
+      if (motor === 1){
+        elLeftDir.textContent = dir === 0 ? "STOP" : dir > 0 ? "FWD" : "BWD";
+        elLeftRate.textContent = rate.toFixed(2);
+        elLeftHz.textContent = String(hz);
+      } else {
+        elRightDir.textContent = dir === 0 ? "STOP" : dir > 0 ? "FWD" : "BWD";
+        elRightRate.textContent = rate.toFixed(2);
+        elRightHz.textContent = String(hz);
+      }
+    }
+
+    function stopAll(){
+      sendMotorCommand(1, 0, 0);
+      sendMotorCommand(2, 0, 0);
+    }
+
+    function syncConfigToTeensys(){
+      if (!wsOpen) {
+        alert("WebSocket not connected. Cannot sync config.");
+        return;
+      }
+      
+      const params = [
+        {param: "HOLD", value: CONFIG.teensy.holdMs},
+        {param: "RAMP", value: CONFIG.teensy.rampMs},
+        {param: "FSTART", value: CONFIG.teensy.fStart},
+        {param: "FEEDINT", value: CONFIG.teensy.feedbackMs},
+        {param: "MAXHZ", value: CONFIG.teensy.maxHz}
+      ];
+      
+      params.forEach(({param, value}) => {
+        ws.send(JSON.stringify({
+          motor: "both",
+          cmd: "config",
+          param: param,
+          value: value
+        }));
+      });
+      
+      console.log("Configuration synced to both Teensys");
+      alert("Configuration sent to both Teensys");
+    }
+
+    btnSync.onclick = syncConfigToTeensys;
+
+    function openWS(){
+      setState("", "connecting…");
+      ws = new WebSocket(CONFIG.wsUrl);
+      ws.onopen = () => { 
+        wsOpen=true; 
+        setState("ok","connected");
+        // Auto-sync config on connect
+        setTimeout(syncConfigToTeensys, 500);
+      };
+      ws.onclose = () => { wsOpen=false; setState("bad","disconnected"); setTimeout(openWS,1000); };
+      ws.onerror = () => { wsOpen=false; setState("warn","error"); };
+      ws.onmessage = ev => { 
+        elSent.textContent = ev.data;
+        try {
+          const resp = JSON.parse(ev.data);
+          console.log("Response:", resp);
+        } catch(e) {}
+      };
+    }
+    openWS();
+
+    btnStop.onclick = stopAll;
+
+    function loop(){
+      const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+      const gp = gps[0];
+      
+      if (gp){
+        elGp.textContent = gp.id;
+
+        const rawY = gp.axes[CONFIG.axes.y] ?? 0.0;
+        const rawTwist = gp.axes[CONFIG.axes.twist] ?? 0.0;
+        const rawThr = gp.axes[CONFIG.axes.throttle] ?? 0.0;
+
+        // Mark gamepad as ready once we get first valid data
+        if (!gamepadReady && gp.connected) {
+          gamepadReady = true;
+        }
+
+        elAxisY.textContent = rawY.toFixed(2);
+        elAxisTwist.textContent = rawTwist.toFixed(2);
+        elAxisThr.textContent = rawThr.toFixed(2);
+
+        const yVal = processAxis(-rawY, CONFIG.control.deadzoneY);
+        const twistVal = processAxis(rawTwist, CONFIG.control.deadzoneTwist);
+        const baseRate = thrToRate(rawThr);
+
+        const yMag = Math.abs(yVal);
+        const twistMag = Math.abs(twistVal);
+        const ySens = yMag > 0 ? Math.pow(yMag, CONFIG.control.sensitivity) : 0;
+        const twistSens = twistMag > 0 ? Math.pow(twistMag, CONFIG.control.sensitivity) : 0;
+
+        const fwdComponent = (yVal > 0 ? ySens : yVal < 0 ? -ySens : 0) * baseRate;
+        const rotComponent = (twistVal > 0 ? twistSens : twistVal < 0 ? -twistSens : 0) * baseRate;
+
+        // Display throttle Hz: axis value +1 = 0 Hz, 0 = half, -1 = max Hz
+        // thrToRate converts: rawThr of +1 -> 0, 0 -> 0.5, -1 -> 1.0
+        const throttleHz = Math.round(CONFIG.control.hzCap * baseRate);
+        elThrottleHz.textContent = String(throttleHz);
+
+        elFwdComp.textContent = fwdComponent.toFixed(2);
+        elRotComp.textContent = rotComponent.toFixed(2);
+
+        let leftSpeed = fwdComponent + rotComponent;
+        let rightSpeed = fwdComponent - rotComponent;
+
+        const maxMag = Math.max(Math.abs(leftSpeed), Math.abs(rightSpeed));
+        let scaleFactor = 1.0;
+        if (maxMag > 1.0){
+          scaleFactor = 1.0 / maxMag;
+          leftSpeed *= scaleFactor;
+          rightSpeed *= scaleFactor;
+        }
+        elScale.textContent = scaleFactor.toFixed(2);
+
+        const leftDir = Math.abs(leftSpeed) < 0.01 ? 0 : leftSpeed > 0 ? +1 : -1;
+        const rightDir = Math.abs(rightSpeed) < 0.01 ? 0 : rightSpeed > 0 ? +1 : -1;
+        const leftRate = Math.abs(leftSpeed);
+        const rightRate = Math.abs(rightSpeed);
+
+        if (leftDir === 0 && rightDir === 0){
+          elMode.className = "mode-indicator mode-drive";
+          elMode.textContent = "STOPPED";
+        } else if (Math.abs(fwdComponent) > Math.abs(rotComponent)){
+          if (fwdComponent > 0){
+            elMode.className = "mode-indicator mode-drive";
+            elMode.textContent = rotComponent > 0 ? "FORWARD + RIGHT TURN" : rotComponent < 0 ? "FORWARD + LEFT TURN" : "FORWARD";
+          } else {
+            elMode.className = "mode-indicator mode-drive";
+            elMode.textContent = rotComponent > 0 ? "BACKWARD + RIGHT TURN" : rotComponent < 0 ? "BACKWARD + LEFT TURN" : "BACKWARD";
+          }
+        } else {
+          elMode.className = "mode-indicator mode-rotate";
+          elMode.textContent = rotComponent > 0 ? "ROTATE CW" : "ROTATE CCW";
+        }
+
+        const now = performance.now();
+        // Only send commands if gamepad is ready (prevents sending on stale/init values)
+        if (wsOpen && gamepadReady && now - lastSendT >= CONFIG.control.sendRateMs){
+          lastSendT = now;
+          sendMotorCommand(1, leftDir, leftRate);
+          sendMotorCommand(2, rightDir, rightRate);
+        }
+      } else {
+        elGp.textContent = "none";
+        gamepadReady = false;  // Reset if gamepad disconnects
+      }
+      
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
